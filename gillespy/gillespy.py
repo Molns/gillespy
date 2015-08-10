@@ -13,6 +13,8 @@ import matplotlib.pyplot as plt
 import tempfile
 import uuid
 import subprocess
+import types
+import random
 
 try:
     import lxml.etree as etree
@@ -39,6 +41,21 @@ except:
 
 import pdb
 
+
+def import_SBML(filename, name=None, gillespy_model=None):
+    """ SBML to GillesPy model converter. NOTE: non-mass-action rates
+    in terms of concentrations may not be converted for population 
+    simulation"""
+    
+    try:
+        from SBMLimport import convert
+    except ImportError:
+        raise ImportError('SBML conversion not imported successfully')
+        
+    return convert(filename, modelName = name, gillespy_model = gillespy_model)
+
+
+
 class Model(object):
     """
     Representation of a well mixed biochemical model. Contains reactions,
@@ -46,7 +63,7 @@ class Model(object):
     
     """
     
-    def __init__(self, name="", volume=1.0):
+    def __init__(self, name="", volume=1.0, population = True):
         """ Create an empty model. """
         
         # The name that the model is referenced by (should be a String)
@@ -63,18 +80,24 @@ class Model(object):
 
         # This defines the unit system at work for all numbers in the model
         #   It should be a logical error to leave this undefined, subclasses should set it
-        self.units = "population"
+        if population == True:
+            self.units = "population"
+        else: 
+            self.units = "concentration"
+            if volume != 1.0:
+                raise Warning("Concentration models account for volume implicitly,explicit volume definition is not required. Note: concentration models may only be simulated deterministically.")
         
         self.volume = volume
-        self.add_parameter(Parameter(name='vol', expression=volume))
         
         # Dict that holds flattended parameters and species for
         # evaluation of expressions in the scope of the model.
         self.namespace = OrderedDict([])
         
         # These are defaults for simulation, and yes it is a bit weired to have them here.
-        self.t = 20
-        self.increment = 0.05
+        #self.t = 20
+        #self.increment = 0.05
+        self.timespan(numpy.linspace(0,20,401))
+        
     
     def serialize(self):
         """ Serializes a Model object to valid StochML. """
@@ -84,6 +107,7 @@ class Model(object):
     
     def update_namespace(self):
         """ Create a dict with flattened parameter and species objects. """
+        self.namespace = OrderedDict([])
         for param in self.listOfParameters:
             self.namespace[param]=self.listOfParameters[param].value
         # Dictionary of expressions that can be evaluated in the scope of this
@@ -124,7 +148,7 @@ class Model(object):
         if units.lower() == 'concentration' or units.lower() == 'population':
             self.units = units.lower()
         else:
-            raise Exception("units must be either concentration or \
+            raise ModelError("units must be either concentration or \
                                 population (case insensitive)")
 
     def get_parameter(self,pname):
@@ -215,8 +239,14 @@ class Model(object):
     def delete_all_reactions(self):
         self.listOfReactions.clear()
 
-    def run(self, number_of_trajectories=1, seed=None, report_level=0):
-        return StochKitSolver.run(self,t=self.tspan[-1],increment=self.tspan[-1]-self.tspan[-2],seed=seed,number_of_trajectories=number_of_trajectories)
+    def run(self, number_of_trajectories=1, seed=None, report_level=0, solver=None, stochkit_home=None, debug=False):
+        if solver is not None:
+            if isinstance(solver, (type, types.ClassType)) and  issubclass(solver, GillesPySolver):
+                return solver.run(self,t=self.tspan[-1],increment=self.tspan[-1]-self.tspan[-2],seed=seed,number_of_trajectories=number_of_trajectories, stochkit_home=stochkit_home, debug=debug)
+            else:
+                raise SimuliationError('argument "solver" to run() must be a subclass of GillesPySolver')
+        else:
+            return StochKitSolver.run(self,t=self.tspan[-1],increment=self.tspan[-1]-self.tspan[-2],seed=seed,number_of_trajectories=number_of_trajectories, stochkit_home=stochkit_home, debug=debug)
 
 
 class Species():
@@ -378,7 +408,7 @@ class Reaction():
             # Case 1: 2X -> Y
             if self.reactants[r] == 2:
                 propensity_function = ("0.5*" +propensity_function+ 
-                                            "*"+r+"*("+r+"-1)")
+                                            "*"+r+"*("+r+"-1)/vol")
             else:
             # Case 3: X1, X2 -> Y;
                 propensity_function += "*"+r
@@ -416,13 +446,10 @@ class Reaction():
 # Module exceptions
 class ModelError(Exception):
     pass
-
 class SpeciesError(ModelError):
     pass
-
 class ReactionError(ModelError):
     pass
-
 class ParameterError(ModelError):
     pass
 class SimuliationError(Exception):
@@ -436,6 +463,7 @@ class StochMLDocument():
     def __init__(self):
         # The root element
         self.document = etree.Element("Model")
+        self.annotation = None
     
     @classmethod
     def from_model(cls,model):
@@ -490,15 +518,14 @@ class StochMLDocument():
             params.append(md.parameter_to_element(
                                         model.listOfParameters[pname]))
 
-        #if model.volume != None and model.units == "population":
-        #    params.append(md.species_to_element(model.volume))
+        params.append(md.parameter_to_element(Parameter(name='vol', expression=model.volume)))
 
         md.document.append(params)
         
         # Reactions
         reacs = etree.Element('ReactionsList')
         for rname in model.listOfReactions:
-            reacs.append(md.reaction_to_element(model.listOfReactions[rname]))
+            reacs.append(md.reaction_to_element(model.listOfReactions[rname], model.volume))
         md.document.append(reacs)
         
         return md
@@ -737,44 +764,35 @@ class StochMLDocument():
         e.append(expressionElement)
         return e
     
-    def reaction_to_element(self,R):
+    def reaction_to_element(self,R, model_volume):
         e = etree.Element('Reaction')
         
         idElement = etree.Element('Id')
         idElement.text = R.name
         e.append(idElement)
         
-        try:
-            descriptionElement = etree.Element('Description')
-            descriptionElement.text = self.annotation
-            e.append(descriptionElement)
-        except:
-            pass
+        descriptionElement = etree.Element('Description')
+        descriptionElement.text = self.annotation
+        e.append(descriptionElement)
         
-        try:
-            typeElement = etree.Element('Type')
-            typeElement.text = R.type
-            e.append(typeElement)
-        except:
-            pass
-    
+
         # StochKit2 wants a rate for mass-action propensites
-        if R.massaction:
-            try:
-                rateElement = etree.Element('Rate')
-                # A mass-action reactions should only have one parameter
-                rateElement.text = R.marate.name
-                e.append(rateElement)
-            except:
-                pass
+        if R.massaction and model_volume == 1.0:
+            rateElement = etree.Element('Rate')
+            # A mass-action reactions should only have one parameter
+            rateElement.text = R.marate.name
+            typeElement = etree.Element('Type')
+            typeElement.text = 'mass-action'
+            e.append(typeElement)
+            e.append(rateElement)
 
         else:
-            #try:
+            typeElement = etree.Element('Type')
+            typeElement.text = 'customized'
+            e.append(typeElement)
             functionElement = etree.Element('PropensityFunction')
             functionElement.text = R.propensity_function
             e.append(functionElement)
-            #except:
-            #    pass
 
         reactants = etree.Element('Reactants')
 
@@ -800,10 +818,9 @@ class StochMLDocument():
 class GillesPySolver():
     ''' abstract class for simulation methods '''
 
-    @classmethod
-    def run(cls, model, t=20, number_of_trajectories=10,
+    def run(self, model, t=20, number_of_trajectories=1,
             increment=0.05, seed=None, stochkit_home=None, algorithm=None,
-            job_id=None):
+            job_id=None, extra_args='', debug=False):
         """ 
         Call out and run the solver. Collect the results.
         """
@@ -823,7 +840,7 @@ class GillesPySolver():
         if isinstance(model, Model):
             outfile =  os.path.join(prefix_basedir, "temp_input_"+job_id+".xml")
             mfhandle = open(outfile, 'w')
-            document = StochMLDocument.from_model(model)
+            #document = StochMLDocument.from_model(model)
 
         # If the model is a Model instance, we serialize it to XML,
         # and if it is an XML file, we just make a copy.
@@ -842,19 +859,6 @@ class GillesPySolver():
         
         outdir = prefix_outdir+'/'+ensemblename
         
-        realizations = number_of_trajectories
-        if increment == None:
-            increment = t/10;
-
-        if seed == None:
-            seed = 0
-        
-        # StochKit breaks for long ints
-        if seed.bit_length()>=32:
-            seed = seed & ((1<<32)-1)
-            if seed > (1 << 31) -1:
-                seed -= 1 << 32
-
 
         # Algorithm, SSA or Tau-leaping?
         executable = None
@@ -890,44 +894,112 @@ class GillesPySolver():
         args += ' --out-dir '+outdir
         args += ' -t '
         args += str(t)
+        if increment == None:
+            increment = t/20.0
         num_output_points = str(int(float(t/increment)))
         args += ' -i ' + num_output_points
-        args += ' --realizations '
-        args += str(realizations)
         if ensemblename in directories:
             print 'Ensemble '+ensemblename+' already existed, using --force.'
             args+=' --force'
         
-        # Only use on processor per StochKit job. 
-        args += ' -p 1'
+
+        # If we are using local mode, shell out and run StochKit 
+        # (SSA or Tau-leaping or ODE)
+        cmd = executable+' '+args+' '+extra_args
+        if debug:
+            print "cmd: {0}".format(cmd)
+
+        # Execute
+        try:
+            #print "CMD: {0}".format(cmd)
+            handle = subprocess.Popen(cmd, stdout = subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+            return_code = handle.wait()
+        except OSError as e:
+            raise SimuliationError("Solver execution failed: \
+            {0}\n{1}".format(cmd, e))
+        
+        try:
+            stderr = handle.stderr.read()
+        except Exception as e:
+            stderr = 'Error reading stderr: {0}'.format(e)
+        try:
+            stdout = handle.stdout.read()
+        except Exception as e:
+            stdout = 'Error reading stdout: {0}'.format(e)
+
+        if return_code != 0:
+            #print stdout
+            #print stderr
+            raise SimuliationError("Solver execution failed: \
+            '{0}' output: {1}{2}".format(cmd,stdout,stderr))
+
+        # Get data using solver specific function
+        try:
+            trajectories = self.get_trajectories(outdir, debug=debug)
+        except Exception as e:
+            raise SimulationError("Error using solver.get_trajectories('{0}'): {1}".format(outdir, e))
+
+        if len(trajectories) == 0:
+            #print stdout
+            #print stderr
+            raise SimuliationError("Solver execution failed: \
+            '{0}' output: {1}{2}".format(cmd,stdout,stderr))
+
+        # Clean up
+        if debug:
+            print "prefix_basedir={0}".format(prefix_basedir)
+            print "STDOUT: {0}".format(stdout)
+            print "STDERR: {0}".format(stderr)
+        else:
+            shutil.rmtree(prefix_basedir)
+        # Return data
+        return trajectories
+
+class StochKitSolver(GillesPySolver):
+    ''' Solver class to simulate Stochastically with StockKit. '''
+    
+    @classmethod
+    def run(cls, model, t=20, number_of_trajectories=1,
+            increment=0.05, seed=None, stochkit_home=None, algorithm='ssa',
+            job_id=None, method=None,debug=False):
+    
+        # all this is specific to StochKit
+        if model.units == "concentration":
+            raise SimuliationError("StochKit can only simulate population models, please convert to population-based model for stochastic simulation. Use solver = StochKitODESolver instead to simulate a concentration model deterministically.")
+
+        if seed is None:
+            seed = random.randint(0, 2147483647)
+        # StochKit breaks for long ints
+        if seed.bit_length()>=32:
+            seed = seed & ((1<<32)-1)
+            if seed > (1 << 31) -1:
+                seed -= 1 << 32
+
+        # Only use on processor per StochKit job.
+        args = ' -p 1'
       
         # We keep all the trajectories by default.
         args += ' --keep-trajectories'
 
         args += ' --seed '
         args += str(seed)
-
-        # If we are using local mode, shell out and run StochKit 
-        # (SSA or Tau-leaping)
-        cmd = executable+' '+args
-
-        # Execute
-        try:
-            handle = subprocess.Popen(cmd.split(' '))
-            return_code = handle.wait()
-            if return_code != 0:
-                raise SimuliationError("Solver execution failed: \
-                '{0}'".format(cmd))
-        except OSError as e:
-            raise SimuliationError("Solver execution failed: \
-            {0}\n{1}".format(cmd, e))
         
+        realizations = number_of_trajectories
+        args += ' --realizations '
+        args += str(realizations)
+
+        if method is not None:  #This only works for StochKit 2.1
+            args += ' --method ' + str(method)
+
+        
+        self = StochKitSolver()
+        return GillesPySolver.run(self, model,t, number_of_trajectories, increment, seed, stochkit_home, algorithm, job_id, extra_args=args, debug=debug)
+
+    def get_trajectories(self, outdir, debug=False):
         # Collect all the output data
         files = os.listdir(outdir + '/stats')
-           
         trajectories = []
         files = os.listdir(outdir + '/trajectories')
-        
         for filename in files:
             if 'trajectory' in filename:
                 trajectories.append(numpy.loadtxt(outdir + '/trajectories/' + 
@@ -935,30 +1007,35 @@ class GillesPySolver():
             else:
                 raise SimuliationError("Couldn't identify file '{0}' found in \
                                         output folder".format(filename))
-
-        # Clean up
-        shutil.rmtree(prefix_basedir)
-
         return trajectories
-
-class StochKitSolver(GillesPySolver):
-    ''' Solver class to simulate Stochasticly with StockKit. '''
-    
-    @classmethod
-    def run(cls, model, t=20, number_of_trajectories=10,
-            increment=0.05, seed=None, stochkit_home=None, algorithm='ssa',
-            job_id=None):
-        return GillesPySolver.run(model,t, number_of_trajectories, increment, seed, stochkit_home, algorithm, job_id)
 
 
 class StochKitODESolver(GillesPySolver):
-    ''' Solver class to simulate Stochasticly with StockKit. '''
+    ''' Solver class to simulate deterministically with StockKitODE. '''
     
     @classmethod
-    def run(cls, model, t=20, number_of_trajectories=10,
+    def run(cls, model, t=20, number_of_trajectories=1,
             increment=0.05, seed=None, stochkit_home=None, algorithm='stochkit_ode.py',
-            job_id=None):
-        return GillesPySolver.run(model,t, number_of_trajectories, increment, seed, stochkit_home, algorithm, job_id)
+            job_id=None, debug=False):
+        self = StochKitODESolver()
+        return GillesPySolver.run(self,model,t, number_of_trajectories, increment, seed, stochkit_home, algorithm, job_id, debug=debug)
+
+    def get_trajectories(self, outdir, debug=False):
+        if debug:
+            print "StochKitODESolver.get_trajectories(outdir={0}".format(outdir)
+        # Collect all the output data
+        trajectories = []
+        with open(outdir + '/output.txt') as fd:
+            fd.readline()
+            headers = fd.readline()
+            fd.readline()
+            data = []
+            data.append([float(x) for x in fd.readline().split()])
+            fd.readline()
+            for line in fd:
+                data.append([float(x) for x in line.split()])
+        trajectories.append(numpy.array(data))
+        return trajectories
 
 
 # Exceptions
